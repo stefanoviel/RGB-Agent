@@ -2,7 +2,7 @@
 
 An agent for [ARC-AGI-3](https://three.arcprize.org/) that completes all three preview games in 1,069 actions, the lowest publicly reported count.
 
-For details on approach and findings, see the our [blog post](https://hillclimbarcagi3.notion.site/).
+For details on approach and findings, see our [blog post](https://blog.alexisfox.dev/arcagi3).
 
 ![Architecture](assets/architecture.png)
 
