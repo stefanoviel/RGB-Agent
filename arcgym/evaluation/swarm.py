@@ -16,7 +16,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Type
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -25,9 +25,9 @@ import arc_agi
 from arc_agi import OperationMode
 
 from arcgym.agents import AVAILABLE_AGENTS
+from arcgym.agents.rgb_agent import RGBAgent
 from arcgym.environments import ArcAgi3Env
 from arcgym.evaluation.config import EVALUATION_GAMES
-from arcgym.evaluation.harness import evaluate_single_game
 from arcgym.metrics.structures import GameMetrics, Status
 from arcgym.metrics.reporting import generate_console_report, save_summary_report, calculate_stats
 
@@ -47,8 +47,7 @@ class Swarm:
 
     def __init__(
         self,
-        agent_class: Type,
-        agent_kwargs: dict[str, Any],
+        inner_agent_kwargs: dict[str, Any],
         arcade: arc_agi.Arcade,
         games: list[str],
         tags: list[str],
@@ -58,8 +57,7 @@ class Swarm:
         log_post_board: bool = True,
         analyzer_retries: int = 5,
     ) -> None:
-        self.agent_class = agent_class
-        self.agent_kwargs = agent_kwargs
+        self.inner_agent_kwargs = inner_agent_kwargs
         self._arcade = arcade
         self.games = games
         self.tags = tags
@@ -97,7 +95,6 @@ class Swarm:
                 arcade=self._arcade, game_id=game_id,
                 scorecard_id=card_id, max_actions=self.max_actions,
             )
-            agent = self.agent_class(**self.agent_kwargs, game_id=game_id)
 
             prompts_log_path = None
             if self.prompts_log_dir:
@@ -106,14 +103,19 @@ class Swarm:
                 prompts_log_path = game_dir / "logs.txt"
                 prompts_log_path.write_text("")
 
-            metrics = evaluate_single_game(
-                agent=agent, env=env, game_id=game_id,
-                agent_name=self.agent_kwargs.get("name", "swarm_agent"),
-                max_actions_per_game=self.max_actions, run_index=1,
-                tags=self.tags, prompts_log_path=prompts_log_path,
-                analyzer=self.analyzer_hook, log_post_board=self.log_post_board,
+            agent = RGBAgent(
+                env=env,
+                game_id=game_id,
+                agent_name=self.inner_agent_kwargs.get("name", "swarm_agent"),
+                max_actions_per_game=self.max_actions,
+                tags=self.tags,
+                prompts_log_path=prompts_log_path,
+                analyzer=self.analyzer_hook,
+                log_post_board=self.log_post_board,
                 analyzer_retries=self.analyzer_retries,
+                inner_agent_kwargs=self.inner_agent_kwargs,
             )
+            metrics = agent.run()
 
             with self._lock:
                 self.results[game_id] = metrics
@@ -123,7 +125,7 @@ class Swarm:
             with self._lock:
                 self.results[game_id] = GameMetrics(
                     game_id=game_id,
-                    agent_name=self.agent_kwargs.get("name", "swarm_agent"),
+                    agent_name=self.inner_agent_kwargs.get("name", "swarm_agent"),
                     start_time=time.time(),
                     status=Status.ERROR,
                     error_message=str(exc),
@@ -206,14 +208,13 @@ def main() -> None:
     run_dir = Path("evaluation_results") / f"{timestamp}_swarm_{args.agent}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    agent_kwargs: dict[str, Any] = {
+    inner_agent_kwargs: dict[str, Any] = {
         "name": args.agent,
         "plan_size": args.analyzer_interval,
     }
 
     swarm = Swarm(
-        agent_class=AVAILABLE_AGENTS[args.agent],
-        agent_kwargs=agent_kwargs,
+        inner_agent_kwargs=inner_agent_kwargs,
         arcade=arcade, games=games, tags=tags,
         max_actions=args.max_actions,
         analyzer_hook=analyzer_hook,
@@ -234,7 +235,6 @@ def main() -> None:
     while runner.is_alive():
         runner.join(timeout=1)
 
-    # Print results
     results_list = list(swarm.results.values())
 
     print(f"\nScorecard ID: {swarm.card_id}")
