@@ -89,6 +89,98 @@ def _normalize_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
     return payload if changed else payload
 
 
+def _as_sse_payloads(payload: dict[str, Any]) -> list[str]:
+    chunks: list[str] = []
+    base = {
+        "id": payload.get("id", f"chatcmpl-{uuid.uuid4().hex[:16]}"),
+        "object": "chat.completion.chunk",
+        "created": payload.get("created"),
+        "model": payload.get("model"),
+    }
+    choices = payload.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        return ['data: [DONE]\n\n']
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    chunks.append(
+        "data: "
+        + json.dumps(
+            {
+                **base,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            },
+            separators=(",", ":"),
+        )
+        + "\n\n"
+    )
+
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        chunks.append(
+            "data: "
+            + json.dumps(
+                {
+                    **base,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                },
+                separators=(",", ":"),
+            )
+            + "\n\n"
+        )
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            chunks.append(
+                "data: "
+                + json.dumps(
+                    {
+                        **base,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": index,
+                                            "id": tool_call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                                            "type": "function",
+                                            "function": tool_call.get("function", {}),
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n\n"
+            )
+
+    finish_reason = choice.get("finish_reason")
+    if tool_calls:
+        finish_reason = "tool_calls"
+    chunks.append(
+        "data: "
+        + json.dumps(
+            {
+                **base,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}],
+            },
+            separators=(",", ":"),
+        )
+        + "\n\n"
+    )
+    return chunks
+
+
 def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -114,15 +206,32 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
         def _forward(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
             body = self.rfile.read(length) if length > 0 else b""
+            body_json: dict[str, Any] | None = None
+            body_text = body.decode("utf-8", errors="ignore")
+            wants_stream = '"stream"' in body_text and "true" in body_text.lower()
+            content_type = self.headers.get("Content-Type", "application/json")
+            if "application/json" in content_type and body:
+                try:
+                    body_json = json.loads(body_text)
+                    wants_stream = wants_stream or bool(body_json.get("stream"))
+                except Exception:
+                    body_json = None
+            if self.path.endswith("/chat/completions"):
+                wants_stream = True
+
             upstream_path = self.path
             if upstream.endswith("/v1") and upstream_path.startswith("/v1/"):
                 upstream_path = upstream_path[3:]
+            if body_json is not None and self.path.endswith("/chat/completions") and wants_stream:
+                body_json = dict(body_json)
+                body_json["stream"] = False
+                body = json.dumps(body_json).encode("utf-8")
             req = Request(
                 f"{upstream}{upstream_path}",
                 data=body,
                 method=self.command,
                 headers={
-                    "Content-Type": self.headers.get("Content-Type", "application/json"),
+                    "Content-Type": content_type,
                     "Authorization": f"Bearer {auth_value}",
                 },
             )
@@ -130,11 +239,11 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                 with urlopen(req, timeout=300) as resp:
                     raw = resp.read()
                     status = resp.status
-                    headers = dict(resp.headers.items())
+                    headers = {str(k).lower(): v for k, v in resp.headers.items()}
             except HTTPError as exc:
                 raw = exc.read()
                 status = exc.code
-                headers = dict(exc.headers.items())
+                headers = {str(k).lower(): v for k, v in exc.headers.items()}
             except URLError as exc:
                 payload = json.dumps({"error": {"message": str(exc)}}).encode("utf-8")
                 self.send_response(502)
@@ -144,17 +253,33 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                 self.wfile.write(payload)
                 return
 
-            content_type = headers.get("Content-Type", "")
-            if self.path.endswith("/chat/completions") and "application/json" in content_type:
+            upstream_content_type = headers.get("content-type", "")
+            if self.path.endswith("/chat/completions") and "application/json" in upstream_content_type:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                     payload = _normalize_chat_completion(payload)
-                    raw = json.dumps(payload).encode("utf-8")
-                except Exception:
-                    pass
+                    sse = "".join(_as_sse_payloads(payload)).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("X-Qwen-Proxy", "stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Content-Length", str(len(sse)))
+                    self.end_headers()
+                    self.wfile.write(sse)
+                    return
+                except Exception as exc:
+                    error_payload = json.dumps({"proxy_error": str(exc)}).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(error_payload)))
+                    self.end_headers()
+                    self.wfile.write(error_payload)
+                    return
 
             self.send_response(status)
-            self.send_header("Content-Type", headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Type", headers.get("content-type", "application/json"))
+            self.send_header("X-Qwen-Proxy", "plain")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
