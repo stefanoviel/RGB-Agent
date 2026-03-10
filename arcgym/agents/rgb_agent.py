@@ -17,7 +17,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, IO, Literal, Optional
 
+import requests
+
 from arcgym.agents.base_agent import BaseArcAgent
+from arcgym.utils.qwen_tool_proxy import start_proxy
 
 log = logging.getLogger(__name__)
 
@@ -401,6 +404,50 @@ def _resolve_opencode_model(model: str) -> tuple[str, dict[str, Any]]:
     return oc_model, {oc_provider: {}}
 
 
+def _direct_completion_analyze(
+    *,
+    endpoint: dict[str, str],
+    model: str,
+    prompt: str,
+    log_path: Path,
+    timeout: Optional[int],
+) -> str | None:
+    log_text = log_path.read_text(encoding="utf-8")
+    full_prompt = (
+        f"{prompt}\n\n"
+        "[PROMPT LOG CONTENTS]\n"
+        f"{log_text}\n"
+        "[END PROMPT LOG CONTENTS]\n"
+    )
+    resp = requests.post(
+        f"{endpoint['base_url'].rstrip('/')}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {endpoint['api_key']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": full_prompt}],
+            "temperature": 0,
+        },
+        timeout=timeout or 300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        texts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("text")]
+        joined = "\n".join(texts).strip()
+        return joined or None
+    return None
+
+
 def _docker_image_exists(image: str) -> bool:
     try:
         result = subprocess.run(
@@ -410,6 +457,10 @@ def _docker_image_exists(image: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _opencode_binary() -> str | None:
+    return shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
 
 
 class _EventStreamParser:
@@ -633,16 +684,35 @@ def make_analyzer(
 
     Hook signature: hook(log_path, action_num, retry_nudge="") -> hint | None
     """
-    if not shutil.which("docker"):
-        raise FileNotFoundError("'docker' CLI not found. Install Docker Desktop to use the analyzer.")
-    if not _docker_image_exists(_DOCKER_IMAGE):
+    docker_path = shutil.which("docker")
+    host_opencode = _opencode_binary()
+    use_host_opencode = False
+    if docker_path and _docker_image_exists(_DOCKER_IMAGE):
+        log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
+    elif host_opencode and Path(host_opencode).exists():
+        use_host_opencode = True
+        log.info("docker unavailable; using host opencode binary: %s", host_opencode)
+    elif not docker_path:
+        raise FileNotFoundError("Neither 'docker' nor a local 'opencode' binary is available for the analyzer.")
+    else:
         raise FileNotFoundError(
-            f"Docker image '{_DOCKER_IMAGE}' not found. Build with:\n"
+            f"Docker image '{_DOCKER_IMAGE}' not found and no local opencode fallback is available. Build with:\n"
             f"  cd docker/opencode-sandbox && bash build.sh"
         )
-    log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
     oc_model, provider_config = _resolve_opencode_model(model)
+    proxy_handle = None
+    cluster_provider = provider_config.get("cluster-vllm")
+    if isinstance(cluster_provider, dict):
+        options = cluster_provider.get("options", {})
+        if isinstance(options, dict):
+            base_url = str(options.get("baseURL", "")).strip()
+            api_key = str(options.get("apiKey", "EMPTY")).strip() or "EMPTY"
+            if base_url:
+                proxy_handle = start_proxy(upstream_base_url=base_url, api_key=api_key)
+                atexit.register(proxy_handle.close)
+                options["baseURL"] = proxy_handle.base_url
+                log.info("using Qwen tool-call compatibility proxy: %s -> %s", proxy_handle.base_url, base_url)
 
     permission: dict = {
         "*": "deny",
@@ -681,8 +751,10 @@ def make_analyzer(
     config_path.write_text(json.dumps(config, indent=2))
     atexit.register(shutil.rmtree, config_dir, True)
 
-    pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
-    atexit.register(pool.cleanup)
+    pool = None
+    if not use_host_opencode:
+        pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
+        atexit.register(pool.cleanup)
 
     session_ids: dict[str, str] = {}
     session_lock = threading.Lock()
@@ -751,35 +823,59 @@ def make_analyzer(
                     current_sid = session_ids[path_key]
                     is_first = False
 
-        container_name, server_port, sandbox_dir = pool.get(path_key)
-        sandbox = Path(sandbox_dir)
+        container_name = None
+        server_port = None
+        sandbox_dir = None
+        sandbox = None
+        if pool is not None:
+            container_name, server_port, sandbox_dir = pool.get(path_key)
+            sandbox = Path(sandbox_dir)
 
         try:
-            shutil.copy2(log_path, sandbox / log_path.name)
-            if allow_self_read and analyzer_log.exists():
-                shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
+            if sandbox is not None:
+                shutil.copy2(log_path, sandbox / log_path.name)
+                if allow_self_read and analyzer_log.exists():
+                    shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
 
             prompt = _build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
+            if use_host_opencode:
+                prompt = prompt.replace(log_path.name, str(log_path))
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
-            oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
-            if resume_session and not is_first and current_sid:
-                oc_args.extend(["--session", current_sid, "--continue"])
-            oc_args.extend(["--model", oc_model])
-            if fast:
-                oc_args.extend(["--variant", "minimal"])
-            oc_args.extend(["--format", "json", "--dir", "/workspace"])
-            oc_args.append(prompt)
-
-            cmd = ["docker", "exec", container_name, "opencode", *oc_args]
-            log.info("exec %s model=%s%s", container_name, oc_model,
-                     f" session={current_sid}" if current_sid else "")
+            if use_host_opencode:
+                oc_args = ["run"]
+                if resume_session and not is_first and current_sid:
+                    oc_args.extend(["--session", current_sid, "--continue"])
+                oc_args.extend(["--model", oc_model])
+                if fast:
+                    oc_args.extend(["--variant", "minimal"])
+                oc_args.extend(["--format", "json", "--dir", str(Path.cwd())])
+                oc_args.append(prompt)
+                cmd = [host_opencode, *oc_args]
+                log.info("exec host-opencode model=%s%s", oc_model, f" session={current_sid}" if current_sid else "")
+            else:
+                oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
+                if resume_session and not is_first and current_sid:
+                    oc_args.extend(["--session", current_sid, "--continue"])
+                oc_args.extend(["--model", oc_model])
+                if fast:
+                    oc_args.extend(["--variant", "minimal"])
+                oc_args.extend(["--format", "json", "--dir", "/workspace"])
+                oc_args.append(prompt)
+                cmd = ["docker", "exec", container_name, "opencode", *oc_args]
+                log.info("exec %s model=%s%s", container_name, oc_model,
+                         f" session={current_sid}" if current_sid else "")
 
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
+                env={
+                    **os.environ,
+                    "OPENCODE_CONFIG": str(config_path),
+                    "OPENCODE_PERMISSION": json.dumps(permission),
+                } if use_host_opencode else None,
             )
 
             stderr_lines: list[str] = []
@@ -829,7 +925,7 @@ def make_analyzer(
                     not parser.accumulated_text.strip()
                     or (action_mode and "[ACTIONS]" not in parser.accumulated_text)
                 )
-                if needs_recovery and parser.session_id:
+                if needs_recovery and parser.session_id and not use_host_opencode and container_name and sandbox_dir:
                     recovered = _try_recover_text(container_name, parser.session_id, sandbox_dir)
                     if recovered:
                         parser.accumulated_text = recovered
