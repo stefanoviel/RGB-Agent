@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -142,7 +143,13 @@ class GameRunner:
                 except QueueExhausted:
                     log.info("queue exhausted at action %d — firing analyzer", total_actions)
                     loaded = False
+                    internal_plan = self._agent.build_internal_plan()
+                    if internal_plan and self._agent.set_action_plan(internal_plan):
+                        loaded = True
+                        log.info("loaded internal plan for %s at action %d", self.game_id, total_actions)
                     for attempt in range(self.analyzer_retries):
+                        if loaded:
+                            break
                         nudge = _RETRY_NUDGE if attempt > 0 or total_actions > 0 else ""
                         log.info("analyzer attempt %d/%d action=%d nudge=%s",
                                  attempt + 1, self.analyzer_retries, total_actions, bool(nudge))
@@ -284,13 +291,15 @@ class GameRunner:
         hint = "\n".join(line.rstrip() for line in hint.split("\n"))
 
         actions_text = None
-        if "\n[ACTIONS]\n" in hint:
-            hint, actions_text = hint.split("\n[ACTIONS]\n", 1)
-            actions_text = actions_text.strip()
+        actions_match = re.search(r"\[\s*ACTIONS\s*\]", hint, flags=re.IGNORECASE)
+        if actions_match:
+            hint, actions_text = hint[:actions_match.start()], hint[actions_match.end():]
+            actions_text = actions_text.strip(" \n:")
 
-        if "\n[PLAN]\n" in hint:
-            full_hint, plan = hint.split("\n[PLAN]\n", 1)
-            full_hint, plan = full_hint.strip(), plan.strip()
+        plan_match = re.search(r"\[\s*PLAN\s*\]", hint, flags=re.IGNORECASE)
+        if plan_match:
+            full_hint, plan = hint[:plan_match.start()], hint[plan_match.end():]
+            full_hint, plan = full_hint.strip(), plan.strip(" \n:")
         else:
             full_hint = plan = hint
 
