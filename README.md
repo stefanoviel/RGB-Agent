@@ -49,7 +49,7 @@ arcgym-swarm --game arc:ls20,rearc:ls20
 | `--game` | — | Comma-separated game names or IDs. Use `arc:` or `rearc:` prefixes when a short name exists in both catalogs. |
 | `--max-actions` | 500 | Max actions per game |
 | `--analyzer-interval` | 10 | Actions per analyzer batch plan |
-| `--analyzer-model` | `claude-opus-4-6` | Analyzer model (see below) |
+| `--analyzer-model` | `auto` | Analyzer model (see below). `auto` prefers the local vLLM server if available. |
 | `--operation-mode` | `online` | `online` / `offline` / `normal` |
 
 Examples:
@@ -60,11 +60,15 @@ Examples:
 
 ### Analyzer models
 
-Anthropic models can be passed without a prefix. For other providers, use `provider/model`.
+`auto` is the default. It prefers a local OpenAI-compatible vLLM server discovered from `OPENAI_BASE_URL` or `/sw/public/vllm_server_registry/qwen3-32b-public.env`, and falls back to Anthropic if no local endpoint is available.
+
+Anthropic models can still be passed without a prefix. For other providers, use `provider/model`.
 
 | Model | `--analyzer-model` value |
 |-------|--------------------------|
-| Claude Opus 4.6 | `claude-opus-4-6` (default) |
+| Local vLLM default | `auto` (default) |
+| Force local vLLM | `local` |
+| Claude Opus 4.6 | `claude-opus-4-6` |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
 | GPT 5.2 | `openai/gpt-5.2` |
 | Gemini 2.5 Pro | `google/gemini-2.5-pro` |

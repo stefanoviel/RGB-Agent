@@ -173,7 +173,7 @@ def main() -> None:
     parser.add_argument("--max-actions", type=int, default=500)
     parser.add_argument("--operation-mode", default="online", choices=["normal", "online", "offline"])
     parser.add_argument("--analyzer-interval", dest="analyzer_interval", type=int, default=10)
-    parser.add_argument("--analyzer-model", dest="analyzer_model", default="claude-opus-4-6")
+    parser.add_argument("--analyzer-model", dest="analyzer_model", default="auto")
     parser.add_argument("--analyzer-retries", dest="analyzer_retries", type=int, default=5)
 
     args = parser.parse_args()

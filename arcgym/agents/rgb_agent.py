@@ -21,6 +21,9 @@ from arcgym.agents.base_agent import BaseArcAgent
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_LOCAL_ANALYZER_SERVER = "qwen3-32b-public"
+_DEFAULT_LOCAL_ANALYZER_REGISTRY = "/sw/public/vllm_server_registry"
+
 
 class QueueExhausted(RuntimeError):
     pass
@@ -298,6 +301,106 @@ _PYTHON_ADDENDUM = (
 _DOCKER_IMAGE = os.environ.get("OPENCODE_DOCKER_IMAGE", "arcgym/opencode-sandbox:latest")
 
 
+def _read_shell_env_file(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not path.exists():
+        return data
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+
+def _discover_local_openai_endpoint(wait_for_ready: bool = True) -> dict[str, str] | None:
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+    if base_url:
+        return {
+            "base_url": base_url,
+            "api_key": os.environ.get("OPENAI_API_KEY", "EMPTY").strip() or "EMPTY",
+            "model_id": os.environ.get("VLLM_MODEL_ID", "").strip() or os.environ.get("ANALYZER_MODEL_ID", "").strip(),
+            "server_name": os.environ.get("VLLM_SERVER_NAME", "").strip() or "env",
+            "status": os.environ.get("VLLM_STATUS", "READY").strip() or "READY",
+        }
+
+    server_name = (
+        os.environ.get("ARCGYM_VLLM_SERVER_NAME", "").strip()
+        or os.environ.get("VLLM_SERVER_NAME", "").strip()
+        or _DEFAULT_LOCAL_ANALYZER_SERVER
+    )
+    registry_dir = Path(
+        os.environ.get("ARCGYM_VLLM_REGISTRY_DIR", "").strip() or _DEFAULT_LOCAL_ANALYZER_REGISTRY
+    )
+    registry_env = registry_dir / f"{server_name}.env"
+    if not registry_env.exists():
+        return None
+
+    wait_seconds = int(os.environ.get("ARCGYM_VLLM_WAIT_SECONDS", "600"))
+    poll_seconds = max(1, int(os.environ.get("ARCGYM_VLLM_POLL_SECONDS", "5")))
+    deadline = time.monotonic() + max(0, wait_seconds)
+    last_status = ""
+
+    while True:
+        data = _read_shell_env_file(registry_env)
+        status = data.get("VLLM_STATUS", "").strip().upper()
+        base_url = data.get("OPENAI_BASE_URL", "").strip()
+        model_id = data.get("VLLM_MODEL_ID", "").strip()
+        if base_url and model_id and (status == "READY" or not wait_for_ready):
+            return {
+                "base_url": base_url,
+                "api_key": data.get("OPENAI_API_KEY", "EMPTY").strip() or "EMPTY",
+                "model_id": model_id,
+                "server_name": data.get("VLLM_SERVER_NAME", server_name).strip() or server_name,
+                "status": status or "UNKNOWN",
+            }
+        if not wait_for_ready:
+            return None
+        if status and status != last_status:
+            log.info("waiting for local vLLM server %s status=%s", server_name, status)
+            last_status = status
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for local vLLM server '{server_name}' to become READY.")
+        time.sleep(poll_seconds)
+
+
+def _resolve_opencode_model(model: str) -> tuple[str, dict[str, Any]]:
+    requested = (model or "").strip()
+    if requested in {"", "auto", "local", "vllm"}:
+        endpoint = _discover_local_openai_endpoint(wait_for_ready=True)
+        if endpoint:
+            provider_id = "cluster-vllm"
+            model_id = endpoint["model_id"]
+            log.info(
+                "using local vLLM analyzer server=%s model=%s base_url=%s",
+                endpoint["server_name"], model_id, endpoint["base_url"],
+            )
+            return (
+                f"{provider_id}/{model_id}",
+                {
+                    provider_id: {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": f"Cluster vLLM ({endpoint['server_name']})",
+                        "options": {
+                            "baseURL": endpoint["base_url"],
+                            "apiKey": endpoint["api_key"],
+                        },
+                        "models": {
+                            model_id: {
+                                "name": model_id,
+                            }
+                        },
+                    }
+                },
+            )
+        requested = "claude-opus-4-6"
+
+    oc_model = requested if "/" in requested else f"anthropic/{requested}"
+    oc_provider = oc_model.split("/")[0]
+    return oc_model, {oc_provider: {}}
+
+
 def _docker_image_exists(image: str) -> bool:
     try:
         result = subprocess.run(
@@ -522,7 +625,7 @@ def make_analyzer(
     action_mode: Optional[Literal["move", "click", "all"]] = None,
     plan_size: int = 5,
     allow_self_read: bool = False,
-    model: str = "claude-opus-4-6",
+    model: str = "auto",
     fast: bool = False,
     resume_session: bool = False,
 ) -> Callable[[Path, int], Optional[str]]:
@@ -539,8 +642,7 @@ def make_analyzer(
         )
     log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
-    oc_model = model if "/" in model else f"anthropic/{model}"
-    oc_provider = oc_model.split("/")[0]
+    oc_model, provider_config = _resolve_opencode_model(model)
 
     permission: dict = {
         "*": "deny",
@@ -569,7 +671,7 @@ def make_analyzer(
 
     config = {
         "model": oc_model,
-        "provider": {oc_provider: {}},
+        "provider": provider_config,
         "permission": permission,
         "agent": {"build": {"steps": 50}},
     }
