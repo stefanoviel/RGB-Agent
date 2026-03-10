@@ -24,33 +24,40 @@ class ArcAgi3Env(BaseEnv):
         arc_api_key: str = "",
         arc_base_url: str = "https://three.arcprize.org",
         operation_mode: OperationMode = OperationMode.NORMAL,
+        environments_dir: str | None = None,
+        manage_scorecard: bool = True,
     ) -> None:
         self.game_id = game_id
         self.max_actions = max_actions
         self.reward_mode = reward_mode
         self.reward_scale = reward_scale
-        self._arc = arc_agi.Arcade(
-            arc_api_key=arc_api_key,
-            arc_base_url=arc_base_url,
-            operation_mode=operation_mode,
-        )
+        arcade_kwargs: dict[str, Any] = {
+            "arc_api_key": arc_api_key,
+            "arc_base_url": arc_base_url,
+            "operation_mode": operation_mode,
+        }
+        if environments_dir is not None:
+            arcade_kwargs["environments_dir"] = environments_dir
+        self._arc = arc_agi.Arcade(**arcade_kwargs)
         self._env = None
         self._actions_taken = 0
         self._last_obs: FrameDataRaw | None = None
-        self._external_scorecard = False
+        self._manage_scorecard = bool(manage_scorecard)
         self._scorecard_id: str | None = None
+        self.replay_base_url: str | None = None if operation_mode == OperationMode.OFFLINE else arc_base_url
 
     @classmethod
     def from_arcade(
         cls,
         arcade: arc_agi.Arcade,
         game_id: str,
-        scorecard_id: str,
+        scorecard_id: str | None = None,
         max_actions: int = 80,
         reward_mode: str = "binary",
         reward_scale: float = 1.0,
+        replay_base_url: str | None = None,
     ) -> ArcAgi3Env:
-        """Create an env with an externally-managed scorecard (Swarm mode)."""
+        """Create an env with an externally-managed arcade instance."""
         inst = cls.__new__(cls)
         inst.game_id = game_id
         inst.max_actions = max_actions
@@ -61,12 +68,13 @@ class ArcAgi3Env(BaseEnv):
         inst._env = None
         inst._actions_taken = 0
         inst._last_obs = None
-        inst._external_scorecard = True
+        inst._manage_scorecard = False
+        inst.replay_base_url = replay_base_url
         return inst
 
     def reset(self, task: dict | None = None) -> tuple[dict, dict]:
         game_id = (task or {}).get("game_id", self.game_id)
-        if not self._external_scorecard:
+        if self._manage_scorecard:
             tags = (task or {}).get("tags", [])
             self._scorecard_id = self.open_scorecard(tags=tags)
         self._env = self._arc.make(game_id, scorecard_id=self._scorecard_id)
@@ -89,7 +97,7 @@ class ArcAgi3Env(BaseEnv):
         return self._format_observation(obs), reward, done
 
     def close(self) -> None:
-        if not self._external_scorecard:
+        if self._manage_scorecard:
             self.close_scorecard(self._scorecard_id)
         self._env = None
         self._last_obs = None

@@ -19,6 +19,12 @@ pip install -e .
 cd docker/opencode-sandbox && bash build.sh   # build analyzer sandbox image
 ```
 
+To enable local packaged RE-ARC games from `Tufalabs/re-arc-3`, install the optional extra:
+
+```bash
+pip install -e ".[rearc]"
+```
+
 Create a `.env` file:
 
 ```
@@ -31,6 +37,8 @@ ANTHROPIC_API_KEY=...
 ```bash
 arcgym-swarm --suite all --max-actions 500
 arcgym-swarm --game ls20,ft09
+arcgym-swarm --game rearc:snake
+arcgym-swarm --game arc:ls20,rearc:ls20
 ```
 
 ### Key flags
@@ -38,11 +46,17 @@ arcgym-swarm --game ls20,ft09
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--suite` | — | Predefined game suites (e.g. `ls20`, `vc33`, `ft09`, or `all`) |
-| `--game` | — | Comma-separated game names or IDs (alternative to `--suite`) |
+| `--game` | — | Comma-separated game names or IDs. Use `arc:` or `rearc:` prefixes when a short name exists in both catalogs. |
 | `--max-actions` | 500 | Max actions per game |
 | `--analyzer-interval` | 10 | Actions per analyzer batch plan |
 | `--analyzer-model` | `claude-opus-4-6` | Analyzer model (see below) |
 | `--operation-mode` | `online` | `online` / `offline` / `normal` |
+
+Examples:
+
+- `arcgym-swarm --game arc:ls20` runs the hosted ARC Prize `ls20-cb3b57cc` game.
+- `arcgym-swarm --game rearc:ls20` runs the local RE-ARC `ls20-0001` packaged game.
+- `arcgym-swarm --game snake-0001` works without a prefix when the ID is unique to RE-ARC.
 
 ### Analyzer models
 
@@ -60,4 +74,3 @@ Any model available via OpenRouter can also be used with the `openrouter/` prefi
 Set the matching API key in `.env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
 
 Results are saved to `evaluation_results/`.
-

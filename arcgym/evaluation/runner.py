@@ -10,7 +10,6 @@ from typing import Any, Callable, Optional
 import requests
 
 from arcgym.agents.rgb_agent import RGBAgent, QueueExhausted
-from arcgym.environments import ArcAgi3Env
 from arcengine import GameState
 from arcgym.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
 
@@ -50,7 +49,7 @@ class GameRunner:
     def __init__(
         self,
         *,
-        env: ArcAgi3Env,
+        env: Any,
         game_id: str,
         agent_name: str,
         max_actions_per_game: int,
@@ -98,6 +97,7 @@ class GameRunner:
 
         try:
             self._agent.reset()
+            replay_base_url = getattr(self.env, "replay_base_url", ROOT_URL)
 
             # Initial reset
             observation = _run_with_retries(
@@ -108,9 +108,9 @@ class GameRunner:
             arc_score = observation.get("score", 0) or 0
 
             guid = observation.get("guid")
-            if guid and not metrics.guid:
+            if replay_base_url and guid and not metrics.guid:
                 metrics.guid = guid
-                metrics.replay_url = f"{ROOT_URL}/replay/{self.game_id}/{guid}"
+                metrics.replay_url = f"{replay_base_url}/replay/{self.game_id}/{guid}"
                 log.info("[%s Run %d] Replay URL: %s", self.game_id, self.run_index, metrics.replay_url)
                 if self.prompts_log_path:
                     info_path = self.prompts_log_path.parent / "run_info.txt"
@@ -259,8 +259,8 @@ class GameRunner:
             metrics.total_state_changes_across_run = sum(lm.total_state_changes for lm in metrics.level_metrics.values())
             metrics.final_score = max_score
 
-            if metrics.guid and not metrics.replay_url:
-                metrics.replay_url = f"{ROOT_URL}/replay/{self.game_id}/{metrics.guid}"
+            if replay_base_url and metrics.guid and not metrics.replay_url:
+                metrics.replay_url = f"{replay_base_url}/replay/{self.game_id}/{metrics.guid}"
 
             loop.close()
 

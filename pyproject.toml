@@ -31,6 +31,9 @@ dev = [
     "pytest",
     "ruff",
 ]
+rearc = [
+    "arc-agi-3-local @ git+https://github.com/Tufalabs/re-arc-3.git@v0.1.1",
+]
 
 [project.scripts]
 arcgym-swarm = "arcgym.evaluation.swarm:main"

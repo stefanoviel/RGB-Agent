@@ -28,6 +28,13 @@ from arcgym.agents import AVAILABLE_AGENTS
 from arcgym.evaluation.runner import GameRunner
 from arcgym.environments import ArcAgi3Env
 from arcgym.evaluation.config import EVALUATION_GAMES
+from arcgym.evaluation.game_sources import (
+    LOCAL_SOURCE,
+    REMOTE_SOURCE,
+    GameSpec,
+    build_local_env,
+    resolve_game_specs,
+)
 from arcgym.metrics.structures import GameMetrics, Status
 from arcgym.metrics.reporting import generate_console_report, save_summary_report, calculate_stats
 
@@ -49,13 +56,14 @@ class Swarm:
         self,
         inner_agent_kwargs: dict[str, Any],
         arcade: arc_agi.Arcade,
-        games: list[str],
+        games: list[GameSpec],
         tags: list[str],
         max_actions: int = 500,
         analyzer_hook: Any = None,
         prompts_log_dir: Path | None = None,
         log_post_board: bool = True,
         analyzer_retries: int = 5,
+        local_source_info: Any | None = None,
     ) -> None:
         self.inner_agent_kwargs = inner_agent_kwargs
         self._arcade = arcade
@@ -66,6 +74,7 @@ class Swarm:
         self.prompts_log_dir = prompts_log_dir
         self.log_post_board = log_post_board
         self.analyzer_retries = analyzer_retries
+        self.local_source_info = local_source_info
 
         self.card_id: str | None = None
         self.scorecard: Any = None
@@ -73,28 +82,41 @@ class Swarm:
         self._lock = threading.Lock()
 
     def run(self) -> dict[str, GameMetrics]:
-        self.card_id = self._arcade.open_scorecard(tags=self.tags)
-        log.info("Opened scorecard %s for %d game(s)", self.card_id, len(self.games))
+        remote_games = [game for game in self.games if game.source == REMOTE_SOURCE]
+        if remote_games:
+            self.card_id = self._arcade.open_scorecard(tags=self.tags)
+            log.info("Opened scorecard %s for %d remote game(s)", self.card_id, len(remote_games))
 
         threads = [
-            threading.Thread(target=self._run_game, args=(self.card_id, gid), daemon=True)
-            for gid in self.games
+            threading.Thread(target=self._run_game, args=(game,), daemon=True)
+            for game in self.games
         ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        self.scorecard = self._arcade.close_scorecard(self.card_id)
-        log.info("Closed scorecard %s", self.card_id)
+        if self.card_id is not None:
+            self.scorecard = self._arcade.close_scorecard(self.card_id)
+            log.info("Closed scorecard %s", self.card_id)
         return self.results
 
-    def _run_game(self, card_id: str, game_id: str) -> None:
+    def _run_game(self, game: GameSpec) -> None:
+        env = None
+        game_id = game.game_id
         try:
-            env = ArcAgi3Env.from_arcade(
-                arcade=self._arcade, game_id=game_id,
-                scorecard_id=card_id, max_actions=self.max_actions,
-            )
+            if game.source == REMOTE_SOURCE:
+                env = ArcAgi3Env.from_arcade(
+                    arcade=self._arcade,
+                    game_id=game_id,
+                    scorecard_id=self.card_id,
+                    max_actions=self.max_actions,
+                    replay_base_url=ROOT_URL,
+                )
+            elif game.source == LOCAL_SOURCE and self.local_source_info is not None:
+                env = build_local_env(game, self.local_source_info, max_actions=self.max_actions)
+            else:
+                raise ValueError(f"Unsupported game source: {game.source}")
 
             prompts_log_path = None
             if self.prompts_log_dir:
@@ -145,7 +167,7 @@ def main() -> None:
     parser.add_argument("--agent", "-a", default="rgb_agent",
                         choices=list(AVAILABLE_AGENTS.keys()))
     parser.add_argument("--game", "-g",
-                        help="Comma-separated game IDs (e.g. ls20-cb3b57cc,ft09-9ab2447a).")
+                        help="Comma-separated game IDs. Use arc: or rearc: prefixes when names are ambiguous.")
     parser.add_argument("--suite", "-s", choices=list(EVALUATION_GAMES.keys()))
     parser.add_argument("--tags", "-t", help="Comma-separated tags.")
     parser.add_argument("--max-actions", type=int, default=500)
@@ -156,16 +178,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Resolve game list — support short names (e.g. "ls20" -> "ls20-cb3b57cc")
-    all_known = {gid for ids in EVALUATION_GAMES.values() for gid in ids}
-    prefix_map = {gid.split("-")[0]: gid for gid in all_known}
-
-    games: list[str] = []
+    games: list[GameSpec] = []
+    local_source_info = None
     if args.game:
         raw = [g.strip() for g in args.game.split(",") if g.strip()]
-        games = [prefix_map.get(g, g) for g in raw]
+        try:
+            games, local_source_info = resolve_game_specs(raw, evaluation_games=EVALUATION_GAMES)
+        except ValueError as exc:
+            log.error("%s", exc)
+            sys.exit(1)
     elif args.suite:
-        games = EVALUATION_GAMES[args.suite]
+        games = [GameSpec(source=REMOTE_SOURCE, game_id=game_id, requested=game_id) for game_id in EVALUATION_GAMES[args.suite]]
     else:
         api_key = os.getenv("ARC_API_KEY", "")
         try:
@@ -175,7 +198,10 @@ def main() -> None:
                 timeout=15,
             )
             resp.raise_for_status()
-            games = [g["game_id"] for g in resp.json()]
+            games = [
+                GameSpec(source=REMOTE_SOURCE, game_id=g["game_id"], requested=g["game_id"])
+                for g in resp.json()
+            ]
             log.info("Fetched %d games from API", len(games))
         except Exception as exc:
             log.error("Failed to fetch games from API: %s", exc)
@@ -221,6 +247,7 @@ def main() -> None:
         prompts_log_dir=run_dir,
         log_post_board=True,
         analyzer_retries=args.analyzer_retries,
+        local_source_info=local_source_info,
     )
 
     runner = threading.Thread(target=swarm.run, daemon=True)
