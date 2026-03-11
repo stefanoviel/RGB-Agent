@@ -1,35 +1,38 @@
-"""Offline replay GIF generation from ARC board logs."""
+"""Replay GIF generation from ARC board logs."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
+from PIL import Image, ImageDraw
+
 _BOARD_MARKERS = {"[INITIAL BOARD STATE]", "[POST-ACTION BOARD STATE]"}
 _CELL_SCALE = 6
-_FRAME_DELAY_CS = 12
+_FRAME_DURATION_MS = 120
 
-_PALETTE = [
-    (16, 18, 24),    # background / fallback
-    (82, 86, 94),    # O
-    (198, 170, 92),  # $
-    (63, 128, 255),  # z
-    (64, 188, 96),   # G
-    (32, 32, 32),    # #
-    (219, 92, 72),   # C
-]
-
-_CHAR_TO_INDEX = {
-    " ": 0,
-    "O": 1,
-    "$": 2,
-    "z": 3,
-    "G": 4,
-    "#": 5,
-    "C": 6,
+_COLORS = {
+    " ": (16, 18, 24),
+    "O": (82, 86, 94),
+    "$": (198, 170, 92),
+    "z": (63, 128, 255),
+    "G": (64, 188, 96),
+    "#": (32, 32, 32),
+    "C": (219, 92, 72),
+    "(": (151, 99, 214),
 }
 
 
-def _parse_board_frames(log_path: Path) -> list[list[str]]:
+def _looks_like_board_row(line: str) -> bool:
+    text = line.strip("\n")
+    if not text:
+        return False
+    if len(text) < 8:
+        return False
+    allowed = set(_COLORS) | {"."}
+    return set(text) <= allowed
+
+
+def parse_board_frames(log_path: Path) -> list[list[str]]:
     frames: list[list[str]] = []
     lines = log_path.read_text(encoding="utf-8").splitlines()
     idx = 0
@@ -40,185 +43,56 @@ def _parse_board_frames(log_path: Path) -> list[list[str]]:
         idx += 1
         if idx < len(lines) and lines[idx].startswith("Score:"):
             idx += 1
+
         board: list[str] = []
-        while idx < len(lines) and lines[idx].strip():
-            board.append(lines[idx].rstrip("\n"))
+        expected_width: int | None = None
+        while idx < len(lines):
+            line = lines[idx].rstrip("\n")
+            if not _looks_like_board_row(line):
+                break
+            if expected_width is None:
+                expected_width = len(line)
+            if len(line) != expected_width:
+                break
+            board.append(line)
             idx += 1
+
         if board:
             frames.append(board)
+        else:
+            idx += 1
     return frames
 
 
-def _render_frame(board: list[str], scale: int = _CELL_SCALE) -> bytes:
+def render_frame(board: list[str], scale: int = _CELL_SCALE) -> Image.Image:
     height = len(board)
     width = len(board[0]) if board else 0
-    pixels = bytearray(width * scale * height * scale)
-    out_width = width * scale
+    image = Image.new("RGB", (width * scale, height * scale), _COLORS[" "])
+    draw = ImageDraw.Draw(image)
     for row_idx, row in enumerate(board):
         for col_idx, char in enumerate(row):
-            color = _CHAR_TO_INDEX.get(char, 0)
-            for sy in range(scale):
-                start = (row_idx * scale + sy) * out_width + col_idx * scale
-                pixels[start:start + scale] = bytes([color]) * scale
-    return bytes(pixels)
-
-
-def _gif_palette_bytes() -> bytes:
-    raw = bytearray()
-    for rgb in _PALETTE:
-        raw.extend(rgb)
-    while len(raw) < 256 * 3:
-        raw.extend((0, 0, 0))
-    return bytes(raw)
-
-
-def _lzw_compress(indices: bytes, min_code_size: int = 8) -> bytes:
-    clear_code = 1 << min_code_size
-    eoi_code = clear_code + 1
-    next_code = eoi_code + 1
-    code_size = min_code_size + 1
-
-    dictionary = {bytes([i]): i for i in range(clear_code)}
-    codes: list[int] = [clear_code]
-    prefix = b""
-
-    for value in indices:
-        candidate = prefix + bytes([value])
-        if candidate in dictionary:
-            prefix = candidate
-            continue
-        if prefix:
-            codes.append(dictionary[prefix])
-        if next_code < 4096:
-            dictionary[candidate] = next_code
-            next_code += 1
-            if next_code == (1 << code_size) and code_size < 12:
-                code_size += 1
-        else:
-            codes.append(clear_code)
-            dictionary = {bytes([i]): i for i in range(clear_code)}
-            next_code = eoi_code + 1
-            code_size = min_code_size + 1
-        prefix = bytes([value])
-
-    if prefix:
-        codes.append(dictionary[prefix])
-    codes.append(eoi_code)
-
-    output = bytearray()
-    bit_buffer = 0
-    bit_count = 0
-
-    dictionary = {bytes([i]): i for i in range(clear_code)}
-    next_code = eoi_code + 1
-    code_size = min_code_size + 1
-    prefix = b""
-
-    code_iter = iter(codes)
-    first = next(code_iter)
-    stream_codes = [first]
-    for value in indices:
-        candidate = prefix + bytes([value])
-        if candidate in dictionary:
-            prefix = candidate
-            continue
-        if prefix:
-            stream_codes.append(dictionary[prefix])
-        if next_code < 4096:
-            dictionary[candidate] = next_code
-            next_code += 1
-            if next_code == (1 << code_size) and code_size < 12:
-                pass
-        else:
-            stream_codes.append(clear_code)
-            dictionary = {bytes([i]): i for i in range(clear_code)}
-            next_code = eoi_code + 1
-        prefix = bytes([value])
-    if prefix:
-        stream_codes.append(dictionary[prefix])
-    stream_codes.append(eoi_code)
-
-    dictionary = {bytes([i]): i for i in range(clear_code)}
-    next_code = eoi_code + 1
-    code_size = min_code_size + 1
-    prefix = b""
-    emitted_clear = False
-    for code in stream_codes:
-        if code == clear_code:
-            emitted_clear = True
-            bit_buffer |= code << bit_count
-            bit_count += code_size
-            while bit_count >= 8:
-                output.append(bit_buffer & 0xFF)
-                bit_buffer >>= 8
-                bit_count -= 8
-            dictionary = {bytes([i]): i for i in range(clear_code)}
-            next_code = eoi_code + 1
-            code_size = min_code_size + 1
-            prefix = b""
-            continue
-        bit_buffer |= code << bit_count
-        bit_count += code_size
-        while bit_count >= 8:
-            output.append(bit_buffer & 0xFF)
-            bit_buffer >>= 8
-            bit_count -= 8
-        if code == eoi_code:
-            break
-        if not emitted_clear:
-            continue
-    if bit_count:
-        output.append(bit_buffer & 0xFF)
-    return bytes(output)
-
-
-def _pack_sub_blocks(payload: bytes) -> bytes:
-    blocks = bytearray()
-    for offset in range(0, len(payload), 255):
-        chunk = payload[offset:offset + 255]
-        blocks.append(len(chunk))
-        blocks.extend(chunk)
-    blocks.append(0)
-    return bytes(blocks)
-
-
-def write_gif(frames: list[bytes], width: int, height: int, output_path: Path, delay_cs: int = _FRAME_DELAY_CS) -> None:
-    header = bytearray()
-    header.extend(b"GIF89a")
-    header.extend(width.to_bytes(2, "little"))
-    header.extend(height.to_bytes(2, "little"))
-    header.append(0xF7)  # global color table, 8-bit palette
-    header.append(0)
-    header.append(0)
-    header.extend(_gif_palette_bytes())
-    header.extend(b"!\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00")
-
-    body = bytearray()
-    for frame in frames:
-        body.extend(b"!\xF9\x04\x04")
-        body.extend(delay_cs.to_bytes(2, "little"))
-        body.extend(b"\x00\x00")
-        body.extend(b",")
-        body.extend((0).to_bytes(2, "little"))
-        body.extend((0).to_bytes(2, "little"))
-        body.extend(width.to_bytes(2, "little"))
-        body.extend(height.to_bytes(2, "little"))
-        body.extend(b"\x00")
-        body.append(8)
-        body.extend(_pack_sub_blocks(_lzw_compress(frame, min_code_size=8)))
-
-    output_path.write_bytes(bytes(header + body + b";"))
+            color = _COLORS.get(char, _COLORS[" "])
+            x0 = col_idx * scale
+            y0 = row_idx * scale
+            draw.rectangle((x0, y0, x0 + scale - 1, y0 + scale - 1), fill=color)
+    return image
 
 
 def generate_replay_gif(log_path: Path, output_path: Path | None = None) -> Path | None:
-    frames = _parse_board_frames(log_path)
+    frames = parse_board_frames(log_path)
     if not frames:
         return None
-    width = len(frames[0][0]) * _CELL_SCALE
-    height = len(frames[0]) * _CELL_SCALE
-    rendered = [_render_frame(frame) for frame in frames]
+    images = [render_frame(frame) for frame in frames]
     dest = output_path or log_path.with_name("replay.gif")
-    write_gif(rendered, width, height, dest)
+    images[0].save(
+        dest,
+        save_all=True,
+        append_images=images[1:],
+        duration=_FRAME_DURATION_MS,
+        loop=0,
+        optimize=False,
+        disposal=2,
+    )
     return dest
 
 
