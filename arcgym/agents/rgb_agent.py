@@ -20,7 +20,6 @@ from typing import Any, Callable, IO, Literal, Optional
 import requests
 
 from arcgym.agents.base_agent import BaseArcAgent
-from arcgym.utils.grid_utils import hash_grid_state
 from arcgym.utils.qwen_tool_proxy import start_proxy
 
 log = logging.getLogger(__name__)
@@ -34,46 +33,6 @@ class QueueExhausted(RuntimeError):
 
 
 _VALID_ACTIONS = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"}
-
-
-def _find_color_bboxes(grid: list[list[int]]) -> dict[int, tuple[int, int, int, int]]:
-    boxes: dict[int, list[int]] = {}
-    for y, row in enumerate(grid):
-        for x, value in enumerate(row):
-            if value in (0, 5):
-                continue
-            if value not in boxes:
-                boxes[value] = [x, y, x, y]
-                continue
-            box = boxes[value]
-            box[0] = min(box[0], x)
-            box[1] = min(box[1], y)
-            box[2] = max(box[2], x)
-            box[3] = max(box[3], y)
-    return {color: (box[0], box[1], box[2], box[3]) for color, box in boxes.items()}
-
-
-def _bbox_to_cell(box: tuple[int, int, int, int]) -> tuple[int, int]:
-    return box[0] // 12, box[1] // 12
-
-
-def _manhattan_plan(src: tuple[int, int], dst: tuple[int, int]) -> list[dict[str, str]]:
-    plan: list[dict[str, str]] = []
-    dx = dst[0] - src[0]
-    dy = dst[1] - src[1]
-    while dy < 0:
-        plan.append({"action": "ACTION1"})
-        dy += 1
-    while dy > 0:
-        plan.append({"action": "ACTION2"})
-        dy -= 1
-    while dx < 0:
-        plan.append({"action": "ACTION3"})
-        dx += 1
-    while dx > 0:
-        plan.append({"action": "ACTION4"})
-        dx -= 1
-    return plan
 
 
 class ActionQueue:
@@ -168,7 +127,6 @@ class RGBAgent(BaseArcAgent):
         self._score_changed: bool = False
         self._use_queued: bool = False
         self._plan_size = plan_size
-        self._identify_agent_color: int | None = None
         super().__init__(**kwargs)
 
     def reset(self) -> None:
@@ -177,7 +135,6 @@ class RGBAgent(BaseArcAgent):
         self._last_score = 0
         self._score_changed = False
         self._use_queued = False
-        self._identify_agent_color = None
 
     @property
     def is_overhead_action(self) -> bool:
@@ -209,65 +166,6 @@ class RGBAgent(BaseArcAgent):
                 self._queue.clear()
             self._score_changed = True
             self._last_score = score
-
-        if obs.get("game_id") == "identify_the_agent-0001" and self._step_history:
-            last = self._step_history[-1]
-            pre = last.get("grid_raw") or []
-            post = last.get("post_grid_raw") or []
-            moved_colors: set[int] = set()
-            for pre_row, post_row in zip(pre, post):
-                for pre_value, post_value in zip(pre_row, post_row):
-                    if pre_value == post_value:
-                        continue
-                    if pre_value not in (0, 5):
-                        moved_colors.add(int(pre_value))
-                    if post_value not in (0, 5):
-                        moved_colors.add(int(post_value))
-            if len(moved_colors) == 1:
-                self._identify_agent_color = next(iter(moved_colors))
-
-    def build_internal_plan(self) -> str | None:
-        obs = self._last_observation or {}
-        if obs.get("game_id") != "identify_the_agent-0001":
-            return None
-
-        grid_raw, _ = self._process_frame(obs)
-        boxes = _find_color_bboxes(grid_raw)
-        if len(boxes) < 2:
-            return None
-
-        if self._identify_agent_color in boxes:
-            agent_color = int(self._identify_agent_color)
-            target_color = next((color for color in boxes if color != agent_color), None)
-            if target_color is None:
-                return None
-            agent_cell = _bbox_to_cell(boxes[agent_color])
-            target_cell = _bbox_to_cell(boxes[target_color])
-            plan = _manhattan_plan(agent_cell, target_cell)
-            if not plan:
-                return None
-            return json.dumps(
-                {
-                    "plan": plan[:8],
-                    "reasoning": (
-                        f"Known controllable token color {agent_color}; move from {agent_cell} "
-                        f"to target color {target_color} at {target_cell}."
-                    ),
-                }
-            )
-
-        tried = self._get_tried_actions(hash_grid_state(grid_raw))
-        for action_name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4"):
-            if action_name not in tried:
-                return json.dumps(
-                    {
-                        "plan": [{"action": action_name}],
-                        "reasoning": (
-                            "Probe one movement direction to identify which colored token is controllable."
-                        ),
-                    }
-                )
-        return None
 
     async def call_llm(self):
         self._use_queued = bool(self._queue and not self._score_changed)
@@ -515,25 +413,11 @@ def _direct_completion_analyze(
     timeout: Optional[int],
 ) -> str | None:
     log_text = log_path.read_text(encoding="utf-8")
-    if len(log_text) > 16000:
-        log_text = "[LOG TAIL]\n" + log_text[-16000:]
     full_prompt = (
-        "Analyze the ARC game log below and produce only a short plan plus JSON actions.\n"
-        "Do not output chain-of-thought, XML tags, tool calls, markdown fences, or extra sections.\n"
-        "Output format:\n"
-        "[PLAN]\n"
-        "2-3 short sentences.\n\n"
-        "[ACTIONS]\n"
-        '{"plan":[{"action":"ACTION1"},{"action":"ACTION6","x":3,"y":7}],"reasoning":"brief reason"}\n\n'
-        "Rules:\n"
-        "- Use only ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6, RESET.\n"
-        "- For ACTION6 include integer x and y.\n"
-        "- Prefer 3-5 actions.\n"
-        "- End your response immediately after the JSON.\n\n"
-        f"Retry note: {prompt[-800:]}\n\n"
-        "[LOG]\n"
+        f"{prompt}\n\n"
+        "[PROMPT LOG CONTENTS]\n"
         f"{log_text}\n"
-        "[END LOG]\n"
+        "[END PROMPT LOG CONTENTS]\n"
     )
     resp = requests.post(
         f"{endpoint['base_url'].rstrip('/')}/chat/completions",
@@ -545,12 +429,10 @@ def _direct_completion_analyze(
             "model": model,
             "messages": [{"role": "user", "content": full_prompt}],
             "temperature": 0,
-            "max_tokens": 2000,
         },
         timeout=timeout or 300,
     )
-    if not resp.ok:
-        raise requests.HTTPError(f"{resp.status_code} {resp.text}", response=resp)
+    resp.raise_for_status()
     data = resp.json()
     choices = data.get("choices") or []
     if not choices:
@@ -820,19 +702,12 @@ def make_analyzer(
 
     oc_model, provider_config = _resolve_opencode_model(model)
     proxy_handle = None
-    direct_completion_endpoint: dict[str, str] | None = None
     cluster_provider = provider_config.get("cluster-vllm")
     if isinstance(cluster_provider, dict):
         options = cluster_provider.get("options", {})
         if isinstance(options, dict):
             base_url = str(options.get("baseURL", "")).strip()
             api_key = str(options.get("apiKey", "EMPTY")).strip() or "EMPTY"
-            model_id = oc_model.split("/", 1)[1] if "/" in oc_model else oc_model
-            direct_completion_endpoint = {
-                "base_url": base_url,
-                "api_key": api_key,
-                "model_id": model_id,
-            }
             if base_url:
                 proxy_handle = start_proxy(upstream_base_url=base_url, api_key=api_key)
                 atexit.register(proxy_handle.close)
@@ -1064,24 +939,6 @@ def make_analyzer(
                 f.flush()
 
             hint = parser.accumulated_text.strip() or None
-
-            if use_host_opencode and not hint and direct_completion_endpoint is not None:
-                log.warning("falling back to direct completion analyzer for local Qwen compatibility")
-                try:
-                    hint = _direct_completion_analyze(
-                        endpoint=direct_completion_endpoint,
-                        model=direct_completion_endpoint["model_id"],
-                        prompt=prompt,
-                        log_path=log_path,
-                        timeout=timeout,
-                    )
-                    if hint:
-                        with open(analyzer_log, "a", encoding="utf-8") as f:
-                            f.write("[DIRECT COMPLETION FALLBACK]\n")
-                            f.write(hint)
-                            f.write("\n\n")
-                except Exception as direct_exc:
-                    log.warning("direct completion fallback failed: %s", direct_exc)
 
             if proc.returncode != 0 or not hint:
                 log.warning("action=%d failed: rc=%d, hint_len=%d",

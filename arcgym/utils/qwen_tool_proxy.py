@@ -6,7 +6,6 @@ import threading
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,7 +13,6 @@ from urllib.request import Request, urlopen
 
 _TOOL_CALL_START = "<tool_call>"
 _TOOL_CALL_END = "</tool_call>"
-_DEBUG_LOG = Path("/tmp/qwen_tool_proxy_debug.log")
 
 
 def _extract_tool_calls(content: str) -> tuple[str | None, list[dict[str, Any]]]:
@@ -219,20 +217,7 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                 except Exception:
                     body_json = None
             if self.path.endswith("/chat/completions"):
-                try:
-                    _DEBUG_LOG.write_text(
-                        json.dumps(
-                            {
-                                "path": self.path,
-                                "content_type": content_type,
-                                "wants_stream": wants_stream,
-                                "body_text": body_text[:4000],
-                            },
-                            indent=2,
-                        )
-                    )
-                except Exception:
-                    pass
+                wants_stream = True
 
             upstream_path = self.path
             if upstream.endswith("/v1") and upstream_path.startswith("/v1/"):
@@ -273,18 +258,16 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                     payload = _normalize_chat_completion(payload)
-                    if wants_stream:
-                        sse = "".join(_as_sse_payloads(payload)).encode("utf-8")
-                        self.send_response(status)
-                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                        self.send_header("X-Qwen-Proxy", "stream")
-                        self.send_header("Cache-Control", "no-cache")
-                        self.send_header("Connection", "keep-alive")
-                        self.send_header("Content-Length", str(len(sse)))
-                        self.end_headers()
-                        self.wfile.write(sse)
-                        return
-                    raw = json.dumps(payload).encode("utf-8")
+                    sse = "".join(_as_sse_payloads(payload)).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("X-Qwen-Proxy", "stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Content-Length", str(len(sse)))
+                    self.end_headers()
+                    self.wfile.write(sse)
+                    return
                 except Exception as exc:
                     error_payload = json.dumps({"proxy_error": str(exc)}).encode("utf-8")
                     self.send_response(500)
