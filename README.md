@@ -89,6 +89,81 @@ What is required:
 - OpenCode available on the host (`~/.opencode/bin/opencode`) or in Docker.
 - The Qwen compatibility path in this repo, which starts a local proxy for the OpenAI-compatible endpoint.
 
+#### Starting a shared vLLM server on the cluster
+
+Use `/home/stefano/slurm_vllm_server/run_vllm_server.sh`. That is the expected entrypoint for this repo on the cluster: it submits a Slurm batch job, starts vLLM inside the Pyxis container, and publishes the endpoint into the shared registry.
+
+Recommended launch:
+
+```bash
+sbatch --partition=llm --account=llm --qos=llm \
+  --ntasks=1 --gpus=1 --cpus-per-gpu=16 --mem-per-gpu=96G \
+  /home/stefano/slurm_vllm_server/run_vllm_server.sh \
+  --model Qwen/Qwen3-32B \
+  --gpus 1 \
+  --server-name qwen3-32b-public \
+  --registry-dir /sw/public/vllm_server_registry \
+  --max-model-len 40960 \
+  --vllm-args "--enable-auto-tool-choice --tool-call-parser qwen3_xml"
+```
+
+Important flags:
+
+- `--ntasks=1`, `--cpus-per-gpu=16`, `--mem-per-gpu=96G`: expected cluster resource shape for these GPU jobs.
+- `--server-name qwen3-32b-public`: other users and jobs discover the endpoint by this name.
+- `--registry-dir /sw/public/vllm_server_registry`: use a shared readable registry path if the server should be public on the cluster.
+- `--max-model-len 40960`: working context size for `Qwen/Qwen3-32B` in this setup.
+- `--vllm-args "--enable-auto-tool-choice --tool-call-parser qwen3_xml"`: enables the tool-calling path used by OpenCode.
+
+To point the current shell at the published endpoint:
+
+```bash
+source /home/stefano/slurm_vllm_server/use_vllm_endpoint.sh \
+  qwen3-32b-public /sw/public/vllm_server_registry
+```
+
+That sets `OPENAI_BASE_URL` from the registry entry.
+
+#### Running this repo against the shared Qwen server
+
+Example command for the seeded local RE-ARC `identify_the_agent` game:
+
+```bash
+OPENAI_BASE_URL=http://dgx01:8316/v1 \
+OPENAI_API_KEY=EMPTY \
+VLLM_MODEL_ID='Qwen/Qwen3-32B' \
+OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=16000 \
+PYTHONPATH=/tmp/re-arc-3 \
+/home/stefano/RGB-Agent/.venv/bin/arcgym-swarm \
+  --game rearc:identify_the_agent \
+  --analyzer-model local \
+  --max-actions 100 \
+  --seed 7
+```
+
+If the server was published to the shared registry, you can usually omit the explicit `OPENAI_BASE_URL` after sourcing `use_vllm_endpoint.sh`:
+
+```bash
+source /home/stefano/slurm_vllm_server/use_vllm_endpoint.sh \
+  qwen3-32b-public /sw/public/vllm_server_registry
+
+OPENAI_API_KEY=EMPTY \
+VLLM_MODEL_ID='Qwen/Qwen3-32B' \
+OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=16000 \
+PYTHONPATH=/tmp/re-arc-3 \
+/home/stefano/RGB-Agent/.venv/bin/arcgym-swarm \
+  --game rearc:identify_the_agent \
+  --analyzer-model local \
+  --max-actions 100 \
+  --seed 7
+```
+
+Notes:
+
+- `--seed` selects a deterministic game variant when the environment supports seeding.
+- `--max-actions` is a total action budget for the full rollout, not per attempt. If the game resets after `GAME_OVER`, the action count keeps increasing.
+- `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=16000` is useful for longer resumed analyzer sessions with local Qwen.
+
 #### Why this was needed
 
 With `Qwen/Qwen3-32B`, the original OpenCode streaming path failed on streamed tool-call deltas. The failure mode was that OpenCode expected the first streamed tool-call chunk to already contain `function.name`, while Qwen/vLLM emitted tool calls incrementally. That caused errors like:
