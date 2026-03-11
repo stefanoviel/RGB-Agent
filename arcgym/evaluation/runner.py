@@ -12,6 +12,7 @@ import requests
 from arcgym.agents.rgb_agent import RGBAgent, QueueExhausted
 from arcengine import GameState
 from arcgym.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
+from arcgym.utils.replay_gif import generate_replay_gif
 
 log = logging.getLogger(__name__)
 
@@ -258,6 +259,15 @@ class GameRunner:
             metrics.total_game_overs_across_run = sum(lm.total_game_overs for lm in metrics.level_metrics.values())
             metrics.total_state_changes_across_run = sum(lm.total_state_changes for lm in metrics.level_metrics.values())
             metrics.final_score = max_score
+
+            if self.prompts_log_path and self.prompts_log_path.exists():
+                try:
+                    gif_path = generate_replay_gif(self.prompts_log_path)
+                    if gif_path is not None:
+                        log.info("[%s Run %d] Replay GIF saved to %s", self.game_id, self.run_index, gif_path)
+                except Exception as exc:
+                    log.warning("[%s Run %d] Failed to generate replay GIF: %s",
+                                self.game_id, self.run_index, exc)
 
             if replay_base_url and metrics.guid and not metrics.replay_url:
                 metrics.replay_url = f"{replay_base_url}/replay/{self.game_id}/{metrics.guid}"
