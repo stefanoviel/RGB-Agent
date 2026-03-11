@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 _DEFAULT_LOCAL_ANALYZER_SERVER = "qwen3-32b-public"
 _DEFAULT_LOCAL_ANALYZER_REGISTRY = "/sw/public/vllm_server_registry"
 _DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX = "8000"
+_DEFAULT_ANALYZER_CONTEXT_WINDOW = 40960
+_DEFAULT_ANALYZER_INPUT_TOKEN_MARGIN = 1536
+_MIN_ANALYZER_INPUT_TOKEN_BUDGET = 4096
+_APPROX_CHARS_PER_TOKEN = 4
 
 
 class QueueExhausted(RuntimeError):
@@ -51,6 +55,56 @@ def _has_actions_block(text: str | None) -> bool:
     if not text:
         return False
     return re.search(r"(?m)^\[ACTIONS\]\s*$", text) is not None
+
+
+def _approx_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + (_APPROX_CHARS_PER_TOKEN - 1)) // _APPROX_CHARS_PER_TOKEN)
+
+
+def _extract_initial_snapshot(log_text: str) -> str:
+    marker = "[INITIAL BOARD STATE]\n"
+    idx = log_text.find(marker)
+    if idx < 0:
+        return ""
+    header_start = log_text.rfind("\n================================================================================", 0, idx)
+    if header_start < 0:
+        header_start = 0
+    else:
+        header_start += 1
+    next_action = log_text.find("\n================================================================================", idx + len(marker))
+    if next_action < 0:
+        return log_text[header_start:].strip()
+    return log_text[header_start:next_action].strip()
+
+
+def _build_bounded_analyzer_log_text(log_text: str, max_input_tokens: int) -> str:
+    if _approx_token_count(log_text) <= max_input_tokens:
+        return log_text
+
+    max_chars = max_input_tokens * _APPROX_CHARS_PER_TOKEN
+    initial_snapshot = _extract_initial_snapshot(log_text)
+    notice = (
+        "[ANALYZER NOTE]\n"
+        f"This view was truncated to fit an approximately {max_input_tokens}-token input budget. "
+        "The middle of the historical log was removed; rely on the latest board states and recent action history.\n\n"
+    )
+
+    parts = [notice]
+    if initial_snapshot:
+        parts.append("[INITIAL SNAPSHOT]\n")
+        parts.append(initial_snapshot)
+        parts.append("\n\n[TRUNCATED MIDDLE]\n\n")
+    assembled = "".join(parts)
+    remaining_chars = max(0, max_chars - len(assembled))
+    tail = log_text[-remaining_chars:] if remaining_chars else ""
+    bounded = f"{assembled}{tail}" if assembled else tail
+
+    # If the initial snapshot plus notice is still too large, fall back to the pure tail.
+    if _approx_token_count(bounded) > max_input_tokens:
+        bounded = log_text[-max_chars:]
+    return bounded
 
 
 class ActionQueue:
@@ -257,6 +311,15 @@ Most games have some form of timer mechanism. A score increase means a level was
 Deeply analyze this log to understand what the agent has been doing, what has worked,
 what hasn't, and what patterns explain the game's behavior.
 
+The action mapping is fixed:
+- ACTION1 = move up
+- ACTION2 = move down
+- ACTION3 = move left
+- ACTION4 = move right
+- ACTION5 = no-op
+- ACTION6 = click at (x=row, y=col)
+- RESET = restart the attempt
+
 Your response MUST contain ALL sections below — the agent cannot act without [ACTIONS]:
 1. A detailed strategic briefing (explain your reasoning, be specific with coordinates)
 2. Followed by exactly this separator and a 2-3 sentence action plan:
@@ -273,6 +336,15 @@ Focus on what changed: new moves, score transitions, and whether the agent follo
 your previous plan or diverged. Parse the board programmatically from the file using
 section markers ([POST-ACTION BOARD STATE], etc.) — do NOT visually copy the grid.
 
+The action mapping is fixed:
+- ACTION1 = move up
+- ACTION2 = move down
+- ACTION3 = move left
+- ACTION4 = move right
+- ACTION5 = no-op
+- ACTION6 = click at (x=row, y=col)
+- RESET = restart the attempt
+
 Your response MUST contain ALL three sections below — the agent cannot act without [ACTIONS]:
 1. A detailed strategic briefing (explain your reasoning, be specific with coordinates)
 2. Followed by exactly this separator and a 2-3 sentence action plan:
@@ -288,6 +360,7 @@ _ACTIONS_ADDENDUM = """
 {{"plan": [{{"action": "ACTION1"}}, {{"action": "ACTION6", "x": 3, "y": 7}}, ...], "reasoning": "why these steps"}}
 
 Available actions: ACTION1-4 (moves), ACTION6 (click at x,y), ACTION5 (no-op), RESET.
+Use the fixed action mapping above; do not infer different direction semantics from the log.
 Each action MUST be a JSON object: {{"action": "ACTION6", "x": <row>, "y": <col>}} for clicks, {{"action": "ACTION1"}} for moves. Never use string shorthand like "ACTION6(x,y)".
 Plan 1–{plan_size} actions. IMPORTANT: shorter plans (3-5 steps) are strongly preferred
 because the agent can re-evaluate sooner. Only use more than 5 if you have very high
@@ -724,11 +797,19 @@ class _EventStreamParser:
 class _ContainerPool:
     """Manages persistent Docker containers running `opencode serve`."""
 
-    def __init__(self, config_path: Path, permission: dict, docker_image: str, sandbox_prefix: str):
+    def __init__(
+        self,
+        config_path: Path,
+        permission: dict,
+        docker_image: str,
+        sandbox_prefix: str,
+        extra_env: dict[str, str] | None = None,
+    ):
         self._config_path = config_path
         self._permission = permission
         self._image = docker_image
         self._prefix = sandbox_prefix
+        self._extra_env = dict(extra_env or {})
         self._containers: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -759,6 +840,9 @@ class _ContainerPool:
         env_flags: list[str] = []
         for key_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
             val = os.environ.get(key_name)
+            if val:
+                env_flags.extend(["-e", f"{key_name}={val}"])
+        for key_name, val in self._extra_env.items():
             if val:
                 env_flags.extend(["-e", f"{key_name}={val}"])
 
@@ -900,13 +984,35 @@ def make_analyzer(
     config_path.write_text(json.dumps(config, indent=2))
     atexit.register(shutil.rmtree, config_dir, True)
 
+    extra_opencode_env: dict[str, str] = {}
+    if direct_completion_endpoint is not None and not os.environ.get("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"):
+        extra_opencode_env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = _DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX
+
     pool = None
     if not use_host_opencode:
-        pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
+        pool = _ContainerPool(
+            config_path,
+            permission,
+            _DOCKER_IMAGE,
+            f"oc_sandbox_{uuid.uuid4().hex[:8]}_",
+            extra_env=extra_opencode_env,
+        )
         atexit.register(pool.cleanup)
 
     session_ids: dict[str, str] = {}
     session_lock = threading.Lock()
+    output_token_budget = int(
+        os.environ.get(
+            "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX",
+            extra_opencode_env.get("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", _DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX),
+        )
+    )
+    analyzer_context_window = int(os.environ.get("ARCGYM_ANALYZER_CONTEXT_WINDOW", str(_DEFAULT_ANALYZER_CONTEXT_WINDOW)))
+    analyzer_input_margin = int(os.environ.get("ARCGYM_ANALYZER_INPUT_TOKEN_MARGIN", str(_DEFAULT_ANALYZER_INPUT_TOKEN_MARGIN)))
+    analyzer_input_budget = max(
+        _MIN_ANALYZER_INPUT_TOKEN_BUDGET,
+        analyzer_context_window - output_token_budget - analyzer_input_margin,
+    )
 
     def _build_prompt(log_name: str, analyzer_log_name: str, analyzer_log_exists: bool,
                       is_first: bool) -> str:
@@ -979,26 +1085,34 @@ def make_analyzer(
                 "OPENCODE_CONFIG": str(config_path),
                 "OPENCODE_PERMISSION": json.dumps(permission),
             }
-            if direct_completion_endpoint is not None and not opencode_env.get("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"):
-                opencode_env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = _DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX
+            for key_name, val in extra_opencode_env.items():
+                if not opencode_env.get(key_name):
+                    opencode_env[key_name] = val
 
         container_name = None
         server_port = None
         sandbox_dir = None
         sandbox = None
+        analyzer_view_path = Path(config_dir) / f"{uuid.uuid4().hex}_{log_path.name}"
         if pool is not None:
             container_name, server_port, sandbox_dir = pool.get(path_key)
             sandbox = Path(sandbox_dir)
 
         try:
+            analyzer_view_text = _build_bounded_analyzer_log_text(
+                log_path.read_text(encoding="utf-8"),
+                analyzer_input_budget,
+            )
+            analyzer_view_path.write_text(analyzer_view_text, encoding="utf-8")
+
             if sandbox is not None:
-                shutil.copy2(log_path, sandbox / log_path.name)
+                shutil.copy2(analyzer_view_path, sandbox / log_path.name)
                 if allow_self_read and analyzer_log.exists():
                     shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
 
             prompt = _build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
             if use_host_opencode:
-                prompt = prompt.replace(log_path.name, str(log_path))
+                prompt = prompt.replace(log_path.name, str(analyzer_view_path))
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
@@ -1132,5 +1246,7 @@ def make_analyzer(
         except Exception as e:
             log.error("unexpected error: %s", e, exc_info=True)
             return None
+        finally:
+            analyzer_view_path.unlink(missing_ok=True)
 
     return hook
