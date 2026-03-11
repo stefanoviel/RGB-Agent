@@ -78,3 +78,54 @@ Any model available via OpenRouter can also be used with the `openrouter/` prefi
 Set the matching API key in `.env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
 
 Results are saved to `evaluation_results/`.
+
+### Qwen + OpenCode notes
+
+`Qwen/Qwen3-32B` can be used as the analyzer through OpenCode, including OpenCode tool use (`read`, `grep`, `bash`), but the working setup is slightly different from the default Anthropic path.
+
+What is required:
+
+- A vLLM server with tool calling enabled.
+- OpenCode available on the host (`~/.opencode/bin/opencode`) or in Docker.
+- The Qwen compatibility path in this repo, which starts a local proxy for the OpenAI-compatible endpoint.
+
+#### Why this was needed
+
+With `Qwen/Qwen3-32B`, the original OpenCode streaming path failed on streamed tool-call deltas. The failure mode was that OpenCode expected the first streamed tool-call chunk to already contain `function.name`, while Qwen/vLLM emitted tool calls incrementally. That caused errors like:
+
+- `Expected 'function.name' to be a string`
+- later, stream termination failures around `data: [DONE]`
+
+#### What changed in OpenCode
+
+To make OpenCode work with `Qwen/Qwen3-32B`, the local OpenCode install was patched so the OpenAI-compatible provider does not rely on streamed tool-call parsing for this model.
+
+The relevant change was in the installed `@ai-sdk/openai-compatible` bundle used by OpenCode:
+
+- `doStream()` detects `Qwen3-32B`
+- it internally calls `doGenerate()`
+- it then emits a synthetic stream from the completed response
+
+That means OpenCode still sees a stream, but Qwen tool calls are parsed from a complete response instead of fragile partial tool-call deltas.
+
+There was also an earlier patch in OpenCode's Copilot-compatible provider path, but the generic OpenAI-compatible provider patch is the one that mattered for the `cluster-vllm` configuration used here.
+
+After patching, OpenCode was rebuilt from `/home/stefano/opencode` and the host binary at `~/.opencode/bin/opencode` was replaced with the rebuilt version.
+
+#### What changed in this repo
+
+This repo adds a compatibility layer around the local Qwen endpoint:
+
+- `arcgym/utils/qwen_tool_proxy.py` normalizes Qwen/vLLM responses for OpenCode
+- `arcgym/agents/rgb_agent.py` can synthesize a final `[ACTIONS]` block from Qwen's analyzer output when the tool-using response does not end with valid action JSON
+- the local Qwen analyzer path can reuse OpenCode sessions and sets `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` to keep resumed sessions within context limits
+
+#### Practical behavior
+
+The result is:
+
+- OpenCode tools are used normally
+- Qwen is still the analyzer model making the decisions
+- this repo executes the resulting action plan
+
+This fixes the transport and tool-calling compatibility problems. It does not guarantee that Qwen will solve every game; remaining failures are strategy-quality issues rather than OpenCode/vLLM protocol issues.
