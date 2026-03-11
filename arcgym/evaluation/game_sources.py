@@ -120,13 +120,14 @@ def resolve_game_specs(
     return specs, local_info
 
 
-def build_local_env(game_spec: GameSpec, local_info: LocalSourceInfo, *, max_actions: int):
+def build_local_env(game_spec: GameSpec, local_info: LocalSourceInfo, *, max_actions: int, seed: int = 0):
     from arcgym.environments import ArcAgi3Env
     from arc_agi import OperationMode
 
     return ArcAgi3Env(
         game_id=game_spec.game_id,
         max_actions=max_actions,
+        seed=seed,
         operation_mode=OperationMode.OFFLINE,
         environments_dir=local_info.environments_dir,
         manage_scorecard=False,

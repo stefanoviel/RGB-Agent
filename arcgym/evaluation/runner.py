@@ -54,6 +54,7 @@ class GameRunner:
         game_id: str,
         agent_name: str,
         max_actions_per_game: int,
+        seed: int = 0,
         run_index: int = 1,
         tags: Optional[list[str]] = None,
         prompts_log_path: Optional[Path] = None,
@@ -66,6 +67,7 @@ class GameRunner:
         self.game_id = game_id
         self.agent_name = agent_name
         self.max_actions_per_game = max_actions_per_game
+        self.seed = int(seed)
         self.run_index = run_index
         self.tags = tags
         self.prompts_log_path = prompts_log_path
@@ -103,7 +105,12 @@ class GameRunner:
             # Initial reset
             observation = _run_with_retries(
                 self.env.reset,
-                task={"game_id": self.game_id, "max_actions": self.max_actions_per_game, "tags": self.tags},
+                task={
+                    "game_id": self.game_id,
+                    "max_actions": self.max_actions_per_game,
+                    "tags": self.tags,
+                    "seed": self.seed,
+                },
             )
             arc_state = GameState[observation.get("state") or "NOT_PLAYED"]
             arc_score = observation.get("score", 0) or 0
@@ -120,6 +127,7 @@ class GameRunner:
                         f"guid: {guid}\n"
                         f"replay_url: {metrics.replay_url}\n"
                         f"scorecard_id: {getattr(self.env, '_scorecard_id', 'unknown')}\n"
+                        f"seed: {self.seed}\n"
                         f"command: {Path(sys.argv[0]).name} {' '.join(sys.argv[1:])}\n"
                     )
 

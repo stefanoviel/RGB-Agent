@@ -19,6 +19,7 @@ class ArcAgi3Env(BaseEnv):
         self,
         game_id: str,
         max_actions: int = 80,
+        seed: int = 0,
         reward_mode: str = "binary",
         reward_scale: float = 1.0,
         arc_api_key: str = "",
@@ -29,6 +30,7 @@ class ArcAgi3Env(BaseEnv):
     ) -> None:
         self.game_id = game_id
         self.max_actions = max_actions
+        self.seed = int(seed)
         self.reward_mode = reward_mode
         self.reward_scale = reward_scale
         arcade_kwargs: dict[str, Any] = {
@@ -53,6 +55,7 @@ class ArcAgi3Env(BaseEnv):
         game_id: str,
         scorecard_id: str | None = None,
         max_actions: int = 80,
+        seed: int = 0,
         reward_mode: str = "binary",
         reward_scale: float = 1.0,
         replay_base_url: str | None = None,
@@ -61,6 +64,7 @@ class ArcAgi3Env(BaseEnv):
         inst = cls.__new__(cls)
         inst.game_id = game_id
         inst.max_actions = max_actions
+        inst.seed = int(seed)
         inst.reward_mode = reward_mode
         inst.reward_scale = reward_scale
         inst._arc = arcade
@@ -74,10 +78,11 @@ class ArcAgi3Env(BaseEnv):
 
     def reset(self, task: dict | None = None) -> tuple[dict, dict]:
         game_id = (task or {}).get("game_id", self.game_id)
+        seed = int((task or {}).get("seed", self.seed))
         if self._manage_scorecard:
             tags = (task or {}).get("tags", [])
             self._scorecard_id = self.open_scorecard(tags=tags)
-        self._env = self._arc.make(game_id, scorecard_id=self._scorecard_id)
+        self._env = self._arc.make(game_id, seed=seed, scorecard_id=self._scorecard_id)
         obs = self._env.reset()
         self._last_obs = obs
         return self._format_observation(obs)

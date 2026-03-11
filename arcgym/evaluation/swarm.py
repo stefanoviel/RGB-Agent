@@ -59,6 +59,7 @@ class Swarm:
         games: list[GameSpec],
         tags: list[str],
         max_actions: int = 500,
+        seed: int = 0,
         analyzer_hook: Any = None,
         prompts_log_dir: Path | None = None,
         log_post_board: bool = True,
@@ -70,6 +71,7 @@ class Swarm:
         self.games = games
         self.tags = tags
         self.max_actions = max_actions
+        self.seed = int(seed)
         self.analyzer_hook = analyzer_hook
         self.prompts_log_dir = prompts_log_dir
         self.log_post_board = log_post_board
@@ -111,10 +113,11 @@ class Swarm:
                     game_id=game_id,
                     scorecard_id=self.card_id,
                     max_actions=self.max_actions,
+                    seed=self.seed,
                     replay_base_url=ROOT_URL,
                 )
             elif game.source == LOCAL_SOURCE and self.local_source_info is not None:
-                env = build_local_env(game, self.local_source_info, max_actions=self.max_actions)
+                env = build_local_env(game, self.local_source_info, max_actions=self.max_actions, seed=self.seed)
             else:
                 raise ValueError(f"Unsupported game source: {game.source}")
 
@@ -136,6 +139,7 @@ class Swarm:
                 log_post_board=self.log_post_board,
                 analyzer_retries=self.analyzer_retries,
                 agent_kwargs=self.inner_agent_kwargs,
+                seed=self.seed,
             )
             metrics = runner.run()
 
@@ -171,6 +175,8 @@ def main() -> None:
     parser.add_argument("--suite", "-s", choices=list(EVALUATION_GAMES.keys()))
     parser.add_argument("--tags", "-t", help="Comma-separated tags.")
     parser.add_argument("--max-actions", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed passed to the ARC environment to choose a deterministic game variant.")
     parser.add_argument("--operation-mode", default="online", choices=["normal", "online", "offline"])
     parser.add_argument("--analyzer-interval", dest="analyzer_interval", type=int, default=10)
     parser.add_argument("--analyzer-model", dest="analyzer_model", default="auto")
@@ -243,6 +249,7 @@ def main() -> None:
         inner_agent_kwargs=inner_agent_kwargs,
         arcade=arcade, games=games, tags=tags,
         max_actions=args.max_actions,
+        seed=args.seed,
         analyzer_hook=analyzer_hook,
         prompts_log_dir=run_dir,
         log_post_board=True,
