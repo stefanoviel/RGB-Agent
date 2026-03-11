@@ -216,15 +216,13 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                     wants_stream = wants_stream or bool(body_json.get("stream"))
                 except Exception:
                     body_json = None
-            if self.path.endswith("/chat/completions"):
-                wants_stream = True
-
             upstream_path = self.path
             if upstream.endswith("/v1") and upstream_path.startswith("/v1/"):
                 upstream_path = upstream_path[3:]
-            if body_json is not None and self.path.endswith("/chat/completions") and wants_stream:
+            if body_json is not None and self.path.endswith("/chat/completions"):
                 body_json = dict(body_json)
-                body_json["stream"] = False
+                if wants_stream:
+                    body_json["stream"] = False
                 body = json.dumps(body_json).encode("utf-8")
             req = Request(
                 f"{upstream}{upstream_path}",
@@ -254,7 +252,7 @@ def start_proxy(*, upstream_base_url: str, api_key: str) -> ProxyHandle:
                 return
 
             upstream_content_type = headers.get("content-type", "")
-            if self.path.endswith("/chat/completions") and "application/json" in upstream_content_type:
+            if wants_stream and self.path.endswith("/chat/completions") and "application/json" in upstream_content_type:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                     payload = _normalize_chat_completion(payload)

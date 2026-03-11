@@ -35,6 +35,23 @@ class QueueExhausted(RuntimeError):
 _VALID_ACTIONS = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"}
 
 
+def _candidate_action_json_strings(actions_text: str) -> list[str]:
+    clean = re.sub(r"```(?:json)?\s*", "", actions_text).strip()
+    candidates = [clean]
+    repaired = clean
+    repaired = re.sub(r'(:\s*-?\d+)"(?=\s*[,}\]])', r"\1", repaired)
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    if repaired != clean:
+        candidates.append(repaired)
+    return candidates
+
+
+def _has_actions_block(text: str | None) -> bool:
+    if not text:
+        return False
+    return re.search(r"(?m)^\[ACTIONS\]\s*$", text) is not None
+
+
 class ActionQueue:
     """Holds and serves a batch of parsed actions."""
 
@@ -61,18 +78,19 @@ class ActionQueue:
 
     def load(self, actions_text: str) -> bool:
         """Parse [ACTIONS] JSON and load the queue. Returns True on success."""
-        clean = re.sub(r"```(?:json)?\s*", "", actions_text).strip()
-
         parsed = None
         decoder = json.JSONDecoder()
-        for char in ("{", "["):
-            idx = clean.find(char)
-            if idx >= 0:
-                try:
-                    parsed, _ = decoder.raw_decode(clean, idx)
-                    break
-                except json.JSONDecodeError:
-                    continue
+        for candidate in _candidate_action_json_strings(actions_text):
+            for char in ("{", "["):
+                idx = candidate.find(char)
+                if idx >= 0:
+                    try:
+                        parsed, _ = decoder.raw_decode(candidate, idx)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if parsed is not None:
+                break
 
         if parsed is None:
             log.warning("ActionQueue.load: could not parse: %s", actions_text[:200])
@@ -448,6 +466,131 @@ def _direct_completion_analyze(
     return None
 
 
+def _strip_qwen_thinking(text: str) -> str:
+    stripped = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    return stripped or text.strip()
+
+
+def _latest_board_excerpt(log_path: Path, max_chars: int = 2500) -> str:
+    text = log_path.read_text(encoding="utf-8")
+    parts = re.split(r"\[(?:POST-ACTION|INITIAL) BOARD STATE\]", text)
+    if len(parts) <= 1:
+        return text[-max_chars:]
+    board = parts[-1].strip()
+    return board[-max_chars:]
+
+
+def _recent_log_excerpt(log_path: Path, max_chars: int = 5000) -> str:
+    text = log_path.read_text(encoding="utf-8")
+    return text[-max_chars:]
+
+
+def _bounding_box(text: str, char: str) -> str:
+    rows: list[int] = []
+    cols: list[int] = []
+    for r, line in enumerate(text.splitlines()):
+        for c, cell in enumerate(line):
+            if cell == char:
+                rows.append(r)
+                cols.append(c)
+    if not rows:
+        return f"{char}: absent"
+    return f"{char}: rows {min(rows)}-{max(rows)}, cols {min(cols)}-{max(cols)}"
+
+
+def _movement_summary(log_path: Path) -> str:
+    text = log_path.read_text(encoding="utf-8")
+    matches = re.findall(r"Step \d+: (ACTION\d).*?\n  Changes: (.*?)(?:\n\n|\nStep |\Z)", text, flags=re.DOTALL)
+    summaries: list[str] = []
+    for action, changes in matches[-6:]:
+        pair = re.search(r"0->7: \((\d+),(\d+)\).*?7->0: \((\d+),(\d+)\)", changes)
+        if pair:
+            new_r, new_c, old_r, old_c = map(int, pair.groups())
+            summaries.append(f"{action}: delta_rows={new_r - old_r}, delta_cols={new_c - old_c}")
+        elif "NO STATE CHANGE" in changes:
+            summaries.append(f"{action}: no state change")
+    latest_board = _latest_board_excerpt(log_path, max_chars=5000)
+    summaries.append(_bounding_box(latest_board, "z"))
+    summaries.append(_bounding_box(latest_board, "G"))
+    return "\n".join(summaries)
+
+
+def _force_actions_from_hint(
+    *,
+    endpoint: dict[str, str],
+    model: str,
+    hint: str,
+    log_path: Path,
+    timeout: Optional[int],
+) -> str | None:
+    latest_board = _latest_board_excerpt(log_path, max_chars=2200)
+    recent_log = _recent_log_excerpt(log_path, max_chars=6000)
+    movement_summary = _movement_summary(log_path)
+    prompt = (
+        "Convert the analysis below into the exact required output format.\n"
+        "Do not call tools. Do not add markdown fences or XML.\n"
+        "You MUST end with a valid [ACTIONS] JSON block.\n\n"
+        "Required format:\n"
+        "[PLAN]\n"
+        "2-3 short sentences.\n\n"
+        "[ACTIONS]\n"
+        '{"plan":[{"action":"ACTION1"},{"action":"ACTION2"}],"reasoning":"brief reason"}\n\n'
+        "Rules:\n"
+        "- Use only ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6, RESET.\n"
+        "- For ACTION6 include integer x and y.\n"
+        "- Prefer 1-5 actions.\n"
+        "- Base the plan on the latest board excerpt below, not on stale earlier guesses.\n"
+        "- Use the recent log tail to infer what ACTION1-4 moved on the last turns.\n"
+        "- The controllable object is the region that changed after recent moves.\n"
+        "- Prefer moves that bring the changed region closer to the green G target region.\n"
+        "- If the recent log tail says a click caused NO STATE CHANGE, do not repeat that click.\n"
+        "- If repeated clicks caused NO STATE CHANGE, prefer ACTION1-4 movement instead.\n"
+        "- Output nothing after the JSON.\n\n"
+        "[LATEST BOARD]\n"
+        f"{latest_board}\n"
+        "[END LATEST BOARD]\n\n"
+        "[RECENT LOG TAIL]\n"
+        f"{recent_log}\n"
+        "[END RECENT LOG TAIL]\n\n"
+        "[MOVEMENT SUMMARY]\n"
+        f"{movement_summary}\n"
+        "[END MOVEMENT SUMMARY]\n\n"
+        "[ANALYSIS]\n"
+        f"{hint[-5000:]}\n"
+        "[END ANALYSIS]\n"
+    )
+    resp = requests.post(
+        f"{endpoint['base_url'].rstrip('/')}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {endpoint['api_key']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 600,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        timeout=timeout or 300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        cleaned = _strip_qwen_thinking(content)
+        return cleaned or None
+    if isinstance(content, list):
+        texts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("text")]
+        joined = _strip_qwen_thinking("\n".join(texts))
+        return joined or None
+    return None
+
+
 def _docker_image_exists(image: str) -> bool:
     try:
         result = subprocess.run(
@@ -702,6 +845,7 @@ def make_analyzer(
 
     oc_model, provider_config = _resolve_opencode_model(model)
     proxy_handle = None
+    direct_completion_endpoint: dict[str, str] | None = None
     cluster_provider = provider_config.get("cluster-vllm")
     if isinstance(cluster_provider, dict):
         options = cluster_provider.get("options", {})
@@ -709,10 +853,16 @@ def make_analyzer(
             base_url = str(options.get("baseURL", "")).strip()
             api_key = str(options.get("apiKey", "EMPTY")).strip() or "EMPTY"
             if base_url:
+                direct_completion_endpoint = {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "model_id": oc_model.split("/", 1)[1] if "/" in oc_model else oc_model,
+                }
                 proxy_handle = start_proxy(upstream_base_url=base_url, api_key=api_key)
                 atexit.register(proxy_handle.close)
                 options["baseURL"] = proxy_handle.base_url
                 log.info("using Qwen tool-call compatibility proxy: %s -> %s", proxy_handle.base_url, base_url)
+    effective_resume_session = resume_session and direct_completion_endpoint is None
 
     permission: dict = {
         "*": "deny",
@@ -761,7 +911,7 @@ def make_analyzer(
 
     def _build_prompt(log_name: str, analyzer_log_name: str, analyzer_log_exists: bool,
                       is_first: bool) -> str:
-        if resume_session and not is_first:
+        if effective_resume_session and not is_first:
             prompt = _RESUME_PROMPT.format(log_path=log_name)
         else:
             prompt = _INITIAL_PROMPT.format(log_path=log_name)
@@ -817,7 +967,7 @@ def make_analyzer(
 
         is_first = True
         current_sid = None
-        if resume_session:
+        if effective_resume_session:
             with session_lock:
                 if path_key in session_ids:
                     current_sid = session_ids[path_key]
@@ -845,7 +995,7 @@ def make_analyzer(
 
             if use_host_opencode:
                 oc_args = ["run"]
-                if resume_session and not is_first and current_sid:
+                if effective_resume_session and not is_first and current_sid:
                     oc_args.extend(["--session", current_sid, "--continue"])
                 oc_args.extend(["--model", oc_model])
                 if fast:
@@ -856,7 +1006,7 @@ def make_analyzer(
                 log.info("exec host-opencode model=%s%s", oc_model, f" session={current_sid}" if current_sid else "")
             else:
                 oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
-                if resume_session and not is_first and current_sid:
+                if effective_resume_session and not is_first and current_sid:
                     oc_args.extend(["--session", current_sid, "--continue"])
                 oc_args.extend(["--model", oc_model])
                 if fast:
@@ -889,7 +1039,7 @@ def make_analyzer(
 
             with open(analyzer_log, "a", encoding="utf-8") as f:
                 f.write(f"\n--- action={action_num} | {datetime.now().strftime('%H:%M:%S')} | opencode ---\n")
-                if is_first or not resume_session:
+                if is_first or not effective_resume_session:
                     f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
                 f.flush()
 
@@ -923,7 +1073,7 @@ def make_analyzer(
 
                 needs_recovery = (
                     not parser.accumulated_text.strip()
-                    or (action_mode and "[ACTIONS]" not in parser.accumulated_text)
+                    or (action_mode and not _has_actions_block(parser.accumulated_text))
                 )
                 if needs_recovery and parser.session_id and not use_host_opencode and container_name and sandbox_dir:
                     recovered = _try_recover_text(container_name, parser.session_id, sandbox_dir)
@@ -931,7 +1081,7 @@ def make_analyzer(
                         parser.accumulated_text = recovered
                         log.info("recovered %d chars via session export", len(recovered))
 
-                if resume_session and parser.session_id is None and not is_first:
+                if effective_resume_session and parser.session_id is None and not is_first:
                     log.warning("context overflow — clearing session for %s", path_key)
                     with session_lock:
                         session_ids.pop(path_key, None)
@@ -940,15 +1090,34 @@ def make_analyzer(
 
             hint = parser.accumulated_text.strip() or None
 
+            if hint and not _has_actions_block(hint) and direct_completion_endpoint is not None:
+                log.warning("action=%d: synthesizing [ACTIONS] from analyzer hint", action_num)
+                try:
+                    synthesized = _force_actions_from_hint(
+                        endpoint=direct_completion_endpoint,
+                        model=direct_completion_endpoint["model_id"],
+                        hint=hint,
+                        log_path=log_path,
+                        timeout=timeout,
+                    )
+                    if synthesized:
+                        hint = synthesized
+                        with open(analyzer_log, "a", encoding="utf-8") as f:
+                            f.write("[SYNTHESIZED ACTIONS]\n")
+                            f.write(hint)
+                            f.write("\n\n")
+                except Exception as synth_exc:
+                    log.warning("action=%d: synthesis failed: %s", action_num, synth_exc)
+
             if proc.returncode != 0 or not hint:
                 log.warning("action=%d failed: rc=%d, hint_len=%d",
                             action_num, proc.returncode, len(hint) if hint else 0)
-                if resume_session:
+                if effective_resume_session:
                     with session_lock:
                         session_ids.pop(path_key, None)
                 return None
 
-            if resume_session and parser.session_id:
+            if effective_resume_session and parser.session_id:
                 with session_lock:
                     session_ids[path_key] = parser.session_id
 
