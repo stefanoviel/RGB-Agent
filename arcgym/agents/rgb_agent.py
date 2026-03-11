@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_LOCAL_ANALYZER_SERVER = "qwen3-32b-public"
 _DEFAULT_LOCAL_ANALYZER_REGISTRY = "/sw/public/vllm_server_registry"
+_DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX = "8000"
 
 
 class QueueExhausted(RuntimeError):
@@ -862,8 +863,6 @@ def make_analyzer(
                 atexit.register(proxy_handle.close)
                 options["baseURL"] = proxy_handle.base_url
                 log.info("using Qwen tool-call compatibility proxy: %s -> %s", proxy_handle.base_url, base_url)
-    effective_resume_session = resume_session and direct_completion_endpoint is None
-
     permission: dict = {
         "*": "deny",
         "read": "allow",
@@ -911,7 +910,7 @@ def make_analyzer(
 
     def _build_prompt(log_name: str, analyzer_log_name: str, analyzer_log_exists: bool,
                       is_first: bool) -> str:
-        if effective_resume_session and not is_first:
+        if resume_session and not is_first:
             prompt = _RESUME_PROMPT.format(log_path=log_name)
         else:
             prompt = _INITIAL_PROMPT.format(log_path=log_name)
@@ -967,11 +966,21 @@ def make_analyzer(
 
         is_first = True
         current_sid = None
-        if effective_resume_session:
+        if resume_session:
             with session_lock:
                 if path_key in session_ids:
                     current_sid = session_ids[path_key]
                     is_first = False
+
+        opencode_env = None
+        if use_host_opencode:
+            opencode_env = {
+                **os.environ,
+                "OPENCODE_CONFIG": str(config_path),
+                "OPENCODE_PERMISSION": json.dumps(permission),
+            }
+            if direct_completion_endpoint is not None and not opencode_env.get("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"):
+                opencode_env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = _DEFAULT_LOCAL_OPENCODE_OUTPUT_TOKEN_MAX
 
         container_name = None
         server_port = None
@@ -995,7 +1004,7 @@ def make_analyzer(
 
             if use_host_opencode:
                 oc_args = ["run"]
-                if effective_resume_session and not is_first and current_sid:
+                if resume_session and not is_first and current_sid:
                     oc_args.extend(["--session", current_sid, "--continue"])
                 oc_args.extend(["--model", oc_model])
                 if fast:
@@ -1006,7 +1015,7 @@ def make_analyzer(
                 log.info("exec host-opencode model=%s%s", oc_model, f" session={current_sid}" if current_sid else "")
             else:
                 oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
-                if effective_resume_session and not is_first and current_sid:
+                if resume_session and not is_first and current_sid:
                     oc_args.extend(["--session", current_sid, "--continue"])
                 oc_args.extend(["--model", oc_model])
                 if fast:
@@ -1021,11 +1030,7 @@ def make_analyzer(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
-                env={
-                    **os.environ,
-                    "OPENCODE_CONFIG": str(config_path),
-                    "OPENCODE_PERMISSION": json.dumps(permission),
-                } if use_host_opencode else None,
+                env=opencode_env,
             )
 
             stderr_lines: list[str] = []
@@ -1039,7 +1044,7 @@ def make_analyzer(
 
             with open(analyzer_log, "a", encoding="utf-8") as f:
                 f.write(f"\n--- action={action_num} | {datetime.now().strftime('%H:%M:%S')} | opencode ---\n")
-                if is_first or not effective_resume_session:
+                if is_first or not resume_session:
                     f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
                 f.flush()
 
@@ -1081,7 +1086,7 @@ def make_analyzer(
                         parser.accumulated_text = recovered
                         log.info("recovered %d chars via session export", len(recovered))
 
-                if effective_resume_session and parser.session_id is None and not is_first:
+                if resume_session and parser.session_id is None and not is_first:
                     log.warning("context overflow — clearing session for %s", path_key)
                     with session_lock:
                         session_ids.pop(path_key, None)
@@ -1112,12 +1117,12 @@ def make_analyzer(
             if proc.returncode != 0 or not hint:
                 log.warning("action=%d failed: rc=%d, hint_len=%d",
                             action_num, proc.returncode, len(hint) if hint else 0)
-                if effective_resume_session:
+                if resume_session:
                     with session_lock:
                         session_ids.pop(path_key, None)
                 return None
 
-            if effective_resume_session and parser.session_id:
+            if resume_session and parser.session_id:
                 with session_lock:
                     session_ids[path_key] = parser.session_id
 
